@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+set -uo pipefail
+umask 077
+
+# Environment is supplied explicitly or by the root-owned systemd EnvironmentFile.
+readonly MONITOR_HTTPS_HOST="${MONITOR_HTTPS_HOST:-}"
+readonly MONITOR_HTTPS_PATHS="${MONITOR_HTTPS_PATHS:-/ /privacy/ /terms/}"
+readonly TRAEFIK_CONFIG="${MONITOR_TRAEFIK_CONFIG:-/etc/traefik/traefik_config.yml}"
+valid_monitor_host() {
+  [[ "$MONITOR_HTTPS_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$MONITOR_HTTPS_HOST" == *.* ]]
+}
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly WEBHOOK_FILE="${MONITOR_WATCHDOG_WEBHOOK_FILE:-/etc/modelmlab-monitoring/watchdog-webhook.url}"
+readonly STATE_DIR="${MONITOR_WATCHDOG_STATE_DIR:-/var/lib/modelmlab-monitoring/watchdog}"
+readonly STATUS_FILE="${STATE_DIR}/status"
+readonly SIGNATURE_FILE="${STATE_DIR}/signature"
+readonly DAILY_FILE="${STATE_DIR}/last-daily-report"
+readonly HOST_NAME="$(hostname -s)"
+readonly REPORT_TZ="${MONITOR_REPORT_TZ:-UTC}"
+
+declare -a problems=()
+declare -a service_lines=()
+declare -a container_lines=()
+
+bounded() {
+  timeout --signal=TERM --kill-after=2s 5s "$@"
+}
+
+check_proxy_routes() {
+  local route code
+  local -a routes
+  if ! valid_monitor_host; then
+    problems+=("HTTPS monitoring hostname is missing or invalid")
+    return 1
+  fi
+  read -r -a routes <<< "$MONITOR_HTTPS_PATHS"
+  if (( ${#routes[@]} == 0 )); then
+    problems+=("HTTPS monitoring paths are missing")
+    return 1
+  fi
+  if timeout --signal=TERM --kill-after=2s 8s docker exec traefik \
+      traefik healthcheck "--configFile=${TRAEFIK_CONFIG}" >/dev/null 2>&1; then
+    container_lines+=("✅ Traefik ping: responding")
+  else
+    problems+=("Traefik ping is not responding")
+    container_lines+=("❌ Traefik ping: failed")
+  fi
+  for route in "${routes[@]}"; do
+    if [[ "$route" != /* || "$route" == //* ]]; then
+      problems+=("HTTPS monitoring path is invalid")
+      return 1
+    fi
+    code="$(curl --noproxy '*' --connect-timeout 3 --max-time 8 \
+      --silent --show-error --output /dev/null --write-out '%{http_code}' \
+      --resolve "${MONITOR_HTTPS_HOST}:443:127.0.0.1" \
+      "https://${MONITOR_HTTPS_HOST}${route}" 2>/dev/null)" || code="request-failed"
+    if [[ "$code" == "200" ]]; then
+      container_lines+=("✅ HTTPS ${MONITOR_HTTPS_HOST}${route}: HTTP 200, TLS verified")
+    else
+      problems+=("HTTPS route ${MONITOR_HTTPS_HOST}${route} failed")
+      container_lines+=("❌ HTTPS ${MONITOR_HTTPS_HOST}${route}: ${code}")
+    fi
+  done
+}
+
+log_error() {
+  logger -t vps-watchdog -- "$*"
+  printf 'vps-watchdog: %s\n' "$*" >&2
+}
+
+# Reuse the bounded, receipt-checking sender. The credential stays inside Python.
+readonly NOTICE_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/notice_state.py"
+send_discord() {
+  printf '%s' "$1" | python3 "$NOTICE_HELPER" send "$WEBHOOK_FILE"
+}
+
+add_service_status() {
+  local unit="$1"
+  local label="$2"
+  local state
+
+  state="$(bounded systemctl is-active "$unit" 2>/dev/null || true)"
+  if [[ "$state" == "active" ]]; then
+    service_lines+=("✅ ${label}: active")
+  else
+    service_lines+=("❌ ${label}: ${state:-unknown}")
+    problems+=("${label} service is ${state:-unknown}")
+  fi
+}
+
+collect_status() {
+  local container state health display_status restarts
+  local failed_output failed_count
+
+  add_service_status docker "Docker"
+  add_service_status tailscaled "Tailscale"
+  add_service_status ssh "SSH"
+  add_service_status crowdsec "CrowdSec"
+  add_service_status crowdsec-firewall-bouncer "CrowdSec firewall bouncer"
+
+  failed_output="$(
+    bounded systemctl --failed --no-legend --plain 2>/dev/null \
+      | awk '$1 != "vps-watchdog.service" {print $1}' \
+      || true
+  )"
+  failed_count="$(printf '%s\n' "$failed_output" | awk 'NF {count++} END {print count+0}')"
+  if (( failed_count > 0 )); then
+    problems+=("${failed_count} systemd unit(s) failed: $(printf '%s' "$failed_output" | paste -sd, -)")
+  fi
+
+  if ! bounded docker info >/dev/null 2>&1; then
+    problems+=("Docker daemon is not responding")
+    container_lines+=("❌ Docker API unavailable")
+  else
+    for container in pangolin gerbil traefik; do
+      if ! bounded docker inspect "$container" >/dev/null 2>&1; then
+        container_lines+=("❌ \`${container}\`: missing")
+        problems+=("Docker container ${container} is missing")
+        continue
+      fi
+
+      state="$(bounded docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || true)"
+      health="$(bounded docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container" 2>/dev/null || true)"
+      display_status="$(bounded docker ps -a --filter "name=^/${container}$" --format '{{.Status}}' | head -n 1)"
+      restarts="$(bounded docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || printf '?')"
+
+      if [[ "$state" == "running" && "$health" != "unhealthy" ]]; then
+        container_lines+=("✅ \`${container}\`: ${display_status:-running}; health=${health}; restarts=${restarts}")
+      else
+        container_lines+=("❌ \`${container}\`: ${display_status:-$state}; health=${health}; restarts=${restarts}")
+        problems+=("Docker container ${container} is ${state:-unknown} (health=${health:-unknown})")
+      fi
+    done
+  fi
+
+  if ! bounded ufw status 2>/dev/null | head -n 1 | grep -q '^Status: active$'; then
+    problems+=("UFW firewall is not active")
+  fi
+}
+
+build_metrics() {
+  uptime_text="$(uptime -p 2>/dev/null | sed 's/^up //' || printf 'unknown')"
+  boot_time="$(uptime -s 2>/dev/null || printf 'unknown')"
+  load_text="$(awk '{print $1", "$2", "$3}' /proc/loadavg)"
+  load_one="$(awk '{print $1}' /proc/loadavg)"
+  cpu_count="$(nproc)"
+
+  read -r mem_total mem_used < <(free -m | awk '/^Mem:/ {print $2, $3}')
+  mem_pct="$((mem_used * 100 / mem_total))"
+
+  read -r disk_size disk_used disk_available disk_pct_text < <(
+    df -hP / | awk 'NR == 2 {print $2, $3, $4, $5}'
+  )
+  disk_pct="${disk_pct_text%%%}"
+
+  tailscale_ip="$(bounded tailscale ip -4 2>/dev/null | head -n 1 || true)"
+  system_state="$(bounded systemctl is-system-running 2>/dev/null || true)"
+  active_bans="$(bounded cscli decisions list -o json 2>/dev/null | jq -r 'if type == "array" then length else 0 end' 2>/dev/null || printf 'unknown')"
+
+  if (( mem_pct >= 90 )); then
+    problems+=("Memory usage is ${mem_pct}%")
+  fi
+  if (( disk_pct >= 85 )); then
+    problems+=("Root filesystem usage is ${disk_pct}%")
+  fi
+  if awk -v current_load="$load_one" -v cpus="$cpu_count" 'BEGIN {exit !(current_load > cpus * 2)}'; then
+    problems+=("One-minute load ${load_one} is more than twice the ${cpu_count} CPU count")
+  fi
+  if [[ -e /var/run/reboot-required ]]; then
+    reboot_text="required"
+    problems+=("A system restart is required")
+  else
+    reboot_text="not required"
+  fi
+}
+
+join_lines() {
+  local -n source_array="$1"
+  printf '%s\n' "${source_array[@]}"
+}
+
+problem_list() {
+  if (( ${#problems[@]} == 0 )); then
+    printf '%s' "None"
+  else
+    printf -- '• %s\n' "${problems[@]}"
+  fi
+}
+
+status_signature() {
+  if (( ${#problems[@]} == 0 )); then
+    printf '%s' "healthy"
+  else
+    printf '%s\n' "${problems[@]}" | sed -E \
+      -e 's/^Memory usage is [0-9]+%$/Memory usage is high/' \
+      -e 's/^Root filesystem usage is [0-9]+%$/Root filesystem usage is high/' \
+      -e 's/^One-minute load [0-9.]+ is more than twice the [0-9]+ CPU count$/One-minute load is high/' \
+      | LC_ALL=C sort -u | sha256sum | awk '{print $1}'
+  fi
+}
+
+daily_report() {
+  local overall_icon overall_text timestamp services containers issues
+
+  if (( ${#problems[@]} == 0 )); then
+    overall_icon="✅"
+    overall_text="Healthy"
+  else
+    overall_icon="🚨"
+    overall_text="Attention required"
+  fi
+
+  timestamp="$(TZ="$REPORT_TZ" date '+%Y-%m-%d %I:%M:%S %p %Z')"
+  services="$(join_lines service_lines)"
+  containers="$(join_lines container_lines)"
+  issues="$(problem_list)"
+
+  printf '%s' "📊 **Daily VPS status — \`${HOST_NAME}\`**
+${overall_icon} Overall: **${overall_text}**
+Time: ${timestamp}
+
+**System**
+• Uptime: ${uptime_text}
+• Booted: ${boot_time}
+• Load (1/5/15m): ${load_text} across ${cpu_count} CPU(s)
+• Memory: ${mem_used}/${mem_total} MiB (${mem_pct}%)
+• Root disk: ${disk_used}/${disk_size} (${disk_pct_text}); ${disk_available} available
+• Systemd: ${system_state:-unknown}
+• Reboot: ${reboot_text}
+• Tailscale IP: ${tailscale_ip:-unavailable}
+• Active CrowdSec decisions: ${active_bans}
+
+**Core services**
+${services}
+**Docker containers**
+${containers}
+**Items requiring attention**
+${issues}"
+}
+
+write_state() {
+  local current_status="$1"
+  local current_signature="$2"
+
+  umask 077
+  printf '%s\n' "$current_status" >"${STATUS_FILE}.tmp"
+  printf '%s\n' "$current_signature" >"${SIGNATURE_FILE}.tmp"
+  mv -f "${STATUS_FILE}.tmp" "$STATUS_FILE"
+  mv -f "${SIGNATURE_FILE}.tmp" "$SIGNATURE_FILE"
+}
+
+main() {
+  local mode="${1:-check}"
+  local current_status current_signature previous_status previous_signature
+  local now_date now_hm last_daily message
+
+  command -v jq >/dev/null 2>&1 || { log_error "jq is not installed"; exit 1; }
+  command -v curl >/dev/null 2>&1 || { log_error "curl is not installed"; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { log_error "python3 is not installed"; exit 1; }
+
+  case "$mode" in
+    check|report|preview) ;;
+    *) printf 'Usage: vps-watchdog [check|report|preview]\n' >&2; return 2 ;;
+  esac
+  command -v timeout >/dev/null 2>&1 || { log_error "timeout is not installed"; return 1; }
+  if [[ "$mode" != "preview" ]]; then
+    command -v flock >/dev/null 2>&1 || { log_error "flock is not installed"; return 1; }
+    umask 077
+    install -d -m 0700 "$STATE_DIR" || return 1
+    exec 9>"${STATE_DIR}/lock" || return 1
+    flock -n 9 || { printf 'Another watchdog run is active; skipped.\n'; return 0; }
+  fi
+  collect_status
+  check_proxy_routes
+  build_metrics
+  if [[ "$mode" == "preview" ]]; then
+    daily_report
+    printf '\n'
+    return 0
+  fi
+
+  if (( ${#problems[@]} == 0 )); then
+    current_status="healthy"
+  else
+    current_status="unhealthy"
+  fi
+  current_signature="$(status_signature)"
+  previous_status="$(cat "$STATUS_FILE" 2>/dev/null || true)"
+  previous_signature="$(cat "$SIGNATURE_FILE" 2>/dev/null || true)"
+
+  if [[ "$mode" == "report" ]]; then
+    send_discord "$(daily_report)" || exit 1
+    write_state "$current_status" "$current_signature"
+    TZ="$REPORT_TZ" date +%F >"$DAILY_FILE"
+    printf 'Initial Discord status report sent successfully.\n'
+    exit 0
+  fi
+
+  if [[ -z "$previous_status" ]]; then
+    if [[ "$current_status" == "healthy" ]]; then
+      message="✅ **VPS watchdog enabled — \`${HOST_NAME}\`**
+All monitored services and containers are healthy."
+    else
+      message="🚨 **VPS watchdog enabled with problems — \`${HOST_NAME}\`**
+$(problem_list)"
+    fi
+    send_discord "$message" || exit 1
+    write_state "$current_status" "$current_signature"
+  elif [[ "$current_status" == "healthy" && "$previous_status" != "healthy" ]]; then
+    message="✅ **VPS watchdog recovered — \`${HOST_NAME}\`**
+All monitored services and containers are healthy again."
+    send_discord "$message" || exit 1
+    write_state "$current_status" "$current_signature"
+  elif [[ "$current_status" == "unhealthy" && "$current_signature" != "$previous_signature" ]]; then
+    message="🚨 **VPS watchdog alert — \`${HOST_NAME}\`**
+$(problem_list)"
+    send_discord "$message" || exit 1
+    write_state "$current_status" "$current_signature"
+  fi
+
+  now_date="$(TZ="$REPORT_TZ" date +%F)"
+  now_hm="$(TZ="$REPORT_TZ" date +%H%M)"
+  last_daily="$(cat "$DAILY_FILE" 2>/dev/null || true)"
+
+  if (( 10#$now_hm >= 900 )) && [[ "$last_daily" != "$now_date" ]]; then
+    send_discord "$(daily_report)" || exit 1
+    printf '%s\n' "$now_date" >"$DAILY_FILE"
+  fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

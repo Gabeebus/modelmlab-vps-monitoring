@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+umask 077
+
+# Environment is supplied explicitly or by the root-owned systemd EnvironmentFile.
+readonly MONITOR_HTTPS_HOST="${MONITOR_HTTPS_HOST:-}"
+readonly MONITOR_HTTPS_PATHS="${MONITOR_HTTPS_PATHS:-/ /privacy/ /terms/}"
+readonly TRAEFIK_CONFIG="${MONITOR_TRAEFIK_CONFIG:-/etc/traefik/traefik_config.yml}"
+valid_monitor_host() {
+  [[ "$MONITOR_HTTPS_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$MONITOR_HTTPS_HOST" == *.* ]]
+}
+
+readonly HOST_NAME="$(hostname -s)"
+readonly COMPOSE_DIR="${MONITOR_COMPOSE_DIR:-/opt/pangolin}"
+readonly COMPOSE_FILE="${MONITOR_COMPOSE_FILE:-${COMPOSE_DIR}/docker-compose.yml}"
+readonly WEBHOOK_FILE="${MONITOR_UPDATER_WEBHOOK_FILE:-/etc/modelmlab-monitoring/updater-webhook.url}"
+readonly LOG_DIR="${MONITOR_UPDATER_LOG_DIR:-/var/log/modelmlab-monitoring/updater}"
+readonly STATE_DIR="${MONITOR_UPDATER_STATE_DIR:-/var/lib/modelmlab-monitoring/updater}"
+
+initialize_state() {
+  mkdir -p "$LOG_DIR" "$STATE_DIR/backups" || return 1
+  chmod 700 "$LOG_DIR" "$STATE_DIR" "$STATE_DIR/backups"
+}
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+readonly NOTICE_HELPER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/notice_state.py"
+
+notice_state() { python3 "$NOTICE_HELPER" "$@"; }
+record_notice() {
+  local kind="$1" reference="$2" key="$3" value="$4" message="$5"
+  printf '%s' "$message" | notice_state record "$STATE_DIR" "$kind" "$reference" "$key" "$value"
+}
+flush_notices() { notice_state flush "$STATE_DIR" "$WEBHOOK_FILE"; }
+
+valid_webhook() {
+  [[ -r "$WEBHOOK_FILE" ]] || return 1
+  webhook="$(sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}' "$WEBHOOK_FILE")"
+  [[ "$webhook" =~ ^https://(discord\.com|discordapp\.com)/api/webhooks/ ]]
+}
+
+send_discord() {
+  # Only the private credential filename reaches argv; the URL stays inside Python.
+  printf '%s' "$1" | notice_state send "$WEBHOOK_FILE"
+}
+
+discord_safe() {
+  send_discord "$1" || echo "Unable to send Discord notification" >&2
+}
+
+format_dpkg_changes() {
+  notice_state capture "$STATE_DIR" /var/log/dpkg.log
+}
+
+remaining_updates() {
+  apt list --upgradable 2>/dev/null |
+    sed '1d' |
+    sed 's#/[^ ]* ##' |
+    sed -n '1,20p'
+}
+
+run_os_updates() {
+  local run_log="$LOG_DIR/os-${timestamp}.log"
+  local rc=0 changes remaining reboot_line message remaining_digest previous_digest
+  local cursor report_rc=0
+
+  exec 9>"/run/lock/modelmlab-updater-os.lock"
+  if ! flock -n 9; then
+    echo "Another OS updater instance is already running."
+    return 0
+  fi
+
+  # Delivery retries do not prevent the security update attempt.
+  flush_notices || echo "Previously queued reports remain pending." >&2
+  (
+    set -e
+    echo "Starting Ubuntu security update run at $(date --iso-8601=seconds)"
+    apt-get update
+    unattended-upgrade --verbose
+    echo "Finished Ubuntu security update run at $(date --iso-8601=seconds)"
+  ) > >(tee "$run_log") 2>&1
+  rc=$?
+
+  if ! changes="$(format_dpkg_changes)"; then
+    echo "Package report capture failed; committed cursor retained." >&2
+    message="Package report capture failed on ${HOST_NAME}. Updater exit: ${rc}. Inspect ${run_log}; previous report progress retained."
+    record_notice os-failed "${timestamp}:capture-failed" - '' "$message" || true
+    flush_notices || true
+    (( rc != 0 )) && return "$rc"
+    return 75
+  fi
+  cursor="$(cat "$STATE_DIR/dpkg.cursor.next")"
+  reboot_line="No reboot is currently required."
+  [[ -e /var/run/reboot-required ]] && reboot_line="A reboot is required."
+
+  if (( rc != 0 )); then
+    message="🚨 **Automatic Ubuntu update failed — \`${HOST_NAME}\`**
+Exit status: ${rc}
+${reboot_line}
+${changes}
+Log: \`${run_log}\`"
+    record_notice os-failed "${timestamp}:${cursor}:${rc}" dpkg.cursor "$cursor" "$message" || report_rc=75
+    flush_notices || echo "Failure report retained for retry." >&2
+    return "$rc"
+  fi
+
+  if [[ -n "$changes" ]]; then
+    message="✅ **Ubuntu security updates installed — \`${HOST_NAME}\`**
+Time: $(date '+%Y-%m-%d %H:%M:%S %Z')
+${reboot_line}
+
+${changes}
+
+Full log: \`${run_log}\`"
+    record_notice os-installed "$cursor" dpkg.cursor "$cursor" "$message" || report_rc=75
+  else
+    record_notice - - dpkg.cursor "$cursor" '' || report_rc=75
+  fi
+
+  remaining="$(remaining_updates)"
+  remaining_digest="$(printf '%s' "$remaining" | sha256sum | awk '{print $1}')"
+  previous_digest="$(notice_state progress "$STATE_DIR" remaining-apt.digest)" || report_rc=75
+  if [[ -n "$remaining" && "$remaining_digest" != "$previous_digest" ]]; then
+    message="ℹ️ **Updates awaiting manual review — \`${HOST_NAME}\`**
+Security updates were handled automatically. These normal or third-party updates remain:
+
+$(printf '%s\n' "$remaining" | sed 's/^/• `/;s/$/`/')"
+    record_notice remaining-updates "$remaining_digest" remaining-apt.digest "$remaining_digest" "$message" || report_rc=75
+  elif [[ -z "$remaining" ]]; then
+    record_notice - - remaining-apt.digest "$remaining_digest" '' || report_rc=75
+  fi
+  # Progress and each message were committed together, before any delivery claim.
+  # An unconfirmed send stays queued; exit75 means pending reporting, not an apt failure.
+  flush_notices || report_rc=75
+  return "$report_rc"
+}
+
+github_releases() {
+  local repository="$1"
+  curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 15 --retry-max-time 50 \
+    --retry 3 \
+    --header 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${repository}/releases?per_page=50"
+}
+
+current_compose_tag() {
+  local image_name="$1"
+  awk -v image="$image_name" '
+    $1 == "image:" && $2 ~ ("/" image ":") {
+      value=$2
+      sub(/^.*:/, "", value)
+      sub(/^v/, "", value)
+      print value
+      exit
+    }
+  ' "$COMPOSE_FILE"
+}
+
+latest_stable_tag() {
+  local repository="$1"
+  github_releases "$repository" |
+    jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name' |
+    sed 's/^v//'
+}
+
+latest_traefik_patch() {
+  local current="$1"
+  local series prefix
+  series="$(printf '%s' "$current" | awk -F. '{print $1 "." $2}')"
+  prefix="v${series}."
+
+  github_releases traefik/traefik |
+    jq -r --arg prefix "$prefix" '
+      .[]
+      | select(.draft == false and .prerelease == false)
+      | .tag_name
+      | select(startswith($prefix))
+    ' |
+    sed 's/^v//' |
+    sort -V |
+    tail -n 1
+}
+
+release_notice_once() {
+  local component="$1" current="$2" latest="$3"
+  local state_file="$STATE_DIR/${component}.available"
+  local state="${current}->${latest}"
+
+  [[ -n "$current" && -n "$latest" && "$current" != "$latest" ]] || return 0
+  [[ "$(cat "$state_file" 2>/dev/null || true)" == "$state" ]] && return 0
+
+  printf '%s\n' "$state" > "$state_file"
+  chmod 600 "$state_file"
+  printf '• `%s`: %s → %s (manual review required)\n' "$component" "$current" "$latest"
+}
+
+
+# Versioned recovery tags are local backups. The owner's Compose images stay latest.
+proxy_ready_once() {
+  local route code
+  local -a routes
+  valid_monitor_host || return 1
+  read -r -a routes <<< "$MONITOR_HTTPS_PATHS"
+  (( ${#routes[@]} > 0 )) || return 1
+  timeout --kill-after=2s 8s docker exec traefik traefik healthcheck "--configFile=${TRAEFIK_CONFIG}" >/dev/null 2>&1 || return 1
+  for route in "${routes[@]}"; do
+    [[ "$route" == /* && "$route" != //* ]] || return 1
+    code="$(curl --noproxy '*' --connect-timeout 3 --max-time 8 --silent --show-error \
+      --output /dev/null --write-out '%{http_code}' \
+      --resolve "${MONITOR_HTTPS_HOST}:443:127.0.0.1" "https://${MONITOR_HTTPS_HOST}${route}" 2>/dev/null)" || return 1
+    [[ "$code" == 200 ]] || return 1
+  done
+}
+
+wait_proxy_ready() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    proxy_ready_once && return 0
+    sleep 3
+  done
+  return 1
+}
+
+run_container_updates() {
+  local run_log="$LOG_DIR/containers-${timestamp}.log"
+  local rc=0
+  exec 9>"/run/lock/modelmlab-updater-containers.lock"
+  if ! flock -n 9; then
+    echo 'Another container updater instance is already running.'
+    return 0
+  fi
+  (
+    set -e
+    umask 077
+    local image old_id new_id old_version new_version old_series new_series
+    local backup recovery_tag override rollback_needed=0 quarantine="$STATE_DIR/traefik.failed-image"
+    local component repository current_id latest release_state notice_file
+    restore_on_failure() {
+      local status=$?
+      trap - EXIT
+      if (( status != 0 && rollback_needed == 1 )); then
+        echo 'Update failed; restoring the exact previously running image.' >&2
+        if timeout --kill-after=5s 180s docker compose -f "$COMPOSE_FILE" -f "$override" \
+            up -d --no-deps --pull never traefik && \
+            [[ "$(docker inspect -f '{{.Image}}' traefik)" == "$old_id" ]] && wait_proxy_ready; then
+          printf '%s\n' "$new_id" > "$quarantine"
+          echo "RECOVERED: previous image and proxy checks verified. Recovery override: $override"
+        else
+          echo "RECOVERY FAILED: immediate owner intervention required. Recovery override: $override" >&2
+        fi
+      fi
+      exit "$status"
+    }
+    trap restore_on_failure EXIT
+    [[ -r "$COMPOSE_FILE" ]]
+    # Read the resolved image without printing Compose secrets or editing the file.
+    image="$(docker compose -f "$COMPOSE_FILE" config --format json | python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["traefik"]["image"])')"
+    case "$image" in
+      traefik:latest|docker.io/traefik:latest|docker.io/library/traefik:latest) ;;
+      *) echo 'Unsupported Traefik image reference; review required. Compose unchanged.' >&2; exit 65 ;;
+    esac
+    old_id="$(docker inspect -f '{{.Image}}' traefik)"
+    [[ "$old_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+    proxy_ready_once || { echo 'Proxy baseline failed before update; nothing replaced.' >&2; exit 1; }
+    timeout --kill-after=5s 300s docker pull "$image"
+    new_id="$(docker image inspect -f '{{.Id}}' "$image")"
+    [[ "$new_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+    if [[ "$new_id" == "$old_id" ]]; then
+      echo 'Traefik latest matches the running image; no recreation needed.'
+    elif [[ "$(cat "$quarantine" 2>/dev/null || true)" == "$new_id" ]]; then
+      echo 'This latest image previously failed validation; holding the recovered image for owner review.'
+    else
+      old_version="$(timeout 10s docker exec traefik traefik version | awk '/^Version:/ {sub(/^v/,"",$2);print $2}')"
+      new_version="$(timeout --kill-after=2s 20s docker run --rm --network none --read-only \
+        --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 --memory 128m \
+        --entrypoint traefik "$new_id" version | awk '/^Version:/ {sub(/^v/,"",$2);print $2}')"
+      [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$new_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+        echo 'Cannot verify release versions; no replacement performed.' >&2; exit 1;
+      }
+      old_series="${old_version%.*}"; new_series="${new_version%.*}"
+      if [[ "$old_series" != "$new_series" ]] || dpkg --compare-versions "$new_version" lt "$old_version"; then
+        notice_file="$STATE_DIR/traefik.pending-review"
+        if [[ "$(cat "$notice_file" 2>/dev/null || true)" != "$new_id" ]]; then
+          send_discord "ℹ️ **Traefik latest needs release review — \`${HOST_NAME}\`**
+Running: ${old_version}; latest: ${new_version}.
+Compose remains latest. Automatic deployment is limited to the current release series; no running container was changed." || exit 1
+          printf '%s\n' "$new_id" > "$notice_file"
+        fi
+        echo 'Latest is a different release series or downgrade; held for owner review.'
+      else
+        backup="$STATE_DIR/backups/docker-compose.${timestamp}.yml"
+        cp -a "$COMPOSE_FILE" "$backup"
+        recovery_tag="modelmlab-local/traefik-recovery:${timestamp}"
+        docker image tag "$old_id" "$recovery_tag"
+        override="$STATE_DIR/backups/traefik-recovery.${timestamp}.json"
+        python3 -c 'import json,sys; print(json.dumps({"services":{"traefik":{"image":sys.argv[1]}}}))' "$recovery_tag" > "$override"
+        docker compose -f "$COMPOSE_FILE" -f "$override" config --quiet
+        rollback_needed=1
+        timeout --kill-after=5s 180s docker compose -f "$COMPOSE_FILE" up -d --no-deps --pull never traefik
+        [[ "$(docker inspect -f '{{.Image}}' traefik)" == "$new_id" ]]
+        wait_proxy_ready
+        rollback_needed=0
+        rm -f "$quarantine"
+        send_discord "✅ **Traefik latest updated and verified — \`${HOST_NAME}\`**
+Version: ${old_version} → ${new_version}
+Traefik ping and configured HTTPS paths passed with certificate validation.
+Previous image recovery override: \`${override}\`
+Compose image reference remains latest." || exit 1
+      fi
+    fi
+    # Pangolin/Gerbil keep their existing notification-only policy. Record notices
+    # only after successful delivery, so a failed delivery can be retried.
+    for component in pangolin gerbil; do
+      repository="fosrl/${component}"
+      latest="$(latest_stable_tag "$repository")"
+      [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid release response' >&2; exit 1; }
+      current_id="$(docker inspect -f '{{.Image}}' "$component")"
+      current_version="$(docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$component" 2>/dev/null || true)"
+      current_version="${current_version#v}"
+      [[ "$current_version" == "$latest" ]] && continue
+      release_state="${current_id}|${latest}"
+      notice_file="$STATE_DIR/${component}.release-review"
+      [[ "$(cat "$notice_file" 2>/dev/null || true)" == "$release_state" ]] && continue
+      send_discord "ℹ️ **${component} release review — \`${HOST_NAME}\`**
+Latest stable release: ${latest}
+Running version label: ${current_version:-unknown}; a missing label does not prove an update is needed.
+Existing policy is review-only; no ${component} image was pulled or deployed." || exit 1
+      printf '%s\n' "$release_state" > "$notice_file"
+    done
+    echo 'Container review completed; Compose image references were not changed.'
+  ) > "$run_log" 2>&1
+  rc=$?
+  cat "$run_log"
+  if (( rc != 0 )); then
+    discord_safe "🚨 **Container updater failed — \`${HOST_NAME}\`**
+Exit status: ${rc}
+See \`${run_log}\` for the verified recovery result. Do not assume recovery succeeded." || true
+  fi
+  return "$rc"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+case "${1:-}" in
+  os)
+    initialize_state || exit 1
+    run_os_updates
+    ;;
+  notices)
+    initialize_state || exit 1
+    exec 9>"/run/lock/modelmlab-updater-os.lock"
+    if flock -n 9; then flush_notices; else echo "Another OS updater/report instance is already running."; fi
+    ;;
+  containers)
+    initialize_state || exit 1
+    run_container_updates
+    ;;
+  *)
+    echo "Usage: $0 {os|containers|notices}" >&2
+    exit 2
+    ;;
+esac
+fi

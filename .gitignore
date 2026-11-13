@@ -1,0 +1,8 @@
+.env
+monitoring.env
+*.url
+*.sqlite*
+*.log
+__pycache__/
+state/
+private/

@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily VPS os update review
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+Unit=modelmlab-vps-os.service
+
+[Install]
+WantedBy=timers.target

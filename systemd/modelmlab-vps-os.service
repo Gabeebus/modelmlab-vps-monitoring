@@ -1,0 +1,17 @@
+[Unit]
+Description=VPS os update review
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/modelmlab-monitoring/monitoring.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=/etc/modelmlab-monitoring/monitoring.env
+ExecStart=/usr/local/libexec/modelmlab-monitoring/vps-auto-updater os
+TimeoutStartSec=2h
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

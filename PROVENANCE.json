@@ -1,0 +1,35 @@
+{
+  "source": "Owner-exported installed monitoring scripts; reusable draft adapted from verified source.",
+  "source_bundle_sha256": "57a450966c5eaf48aa9ebc43350e834b1d0c156251b8aeddb60815285260e732",
+  "original_scripts": {
+    "vps-watchdog": "11544c5af50bcd2141a5c10e3b7221d0d8aad08745069b1dbd57179005e216fe",
+    "vps-auto-updater": "2b45fdf6c14200f7c1c7a44ae3db807de959e63444a419f5cdf8123d882ba07d"
+  },
+  "changes": [
+    "Owner hostname replaced by required environment setting",
+    "Paths and report timezone configurable",
+    "Dedicated default state/log paths",
+    "Private log umask",
+    "Updater state creation deferred until an explicit mode executes",
+    "Durable SQLite OS report outbox commits messages and report progress together",
+    "Report retry-only command without apt or container execution",
+    "Discord updater webhook read inside Python instead of command arguments; bounded retries and disabled mentions",
+    "Explicit APT/dpkg/unattended-upgrade installation prerequisites",
+    "Watchdog uses the same private-file receipt-verified notification sender"
+  ],
+  "license": "No license selected.",
+  "validation": {
+    "offline_checks": 50,
+    "linux": "Debian 13, root, network-disabled",
+    "live_watchdog": "Actual probes, isolated trusted TLS destination, route fault/restoration, retry and deduplication passed",
+    "live_os": "Debian security-only policy; 10 packages changed; no reboot; two reports sent; empty outbox retry deduplicated",
+    "live_container_updater": "Unchanged updater executable; isolated Pangolin/Gerbil/Traefik patch replacement, failed replacement, exact-image recovery and candidate quarantine passed",
+    "fresh_install": "See exact source-manifest-bound installation receipt; do not substitute historical revision evidence",
+    "excluded": [
+      "Production host modification",
+      "External client/DNS/public certificate/UDP tests",
+      "Ubuntu live trial",
+      "All monitored services configured and healthy"
+    ]
+  }
+}
